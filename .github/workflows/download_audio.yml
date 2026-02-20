@@ -1,0 +1,75 @@
+name: Download and Commit Audios
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0" # Runs weekly on Sunday at 3 AM UTC
+
+jobs:
+  download-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget python3-pandas
+
+      - name: Download all audios and images
+        run: |
+          mkdir -p apps_audio
+          cd apps_audio
+          wget -r -np -nH --cut-dirs=1 -R "index.html*" https://ya-mahdi.net/apps_audio/
+          cd ..
+
+      - name: Generate CSV mapping file
+        run: |
+          python3 <<'EOF'
+          import os, csv
+
+          base_url = "https://ya-mahdi.net/apps_audio/"
+          github_repo = "https://github.com/${{ github.repository }}/blob/main/apps_audio/"
+          raw_repo = "https://raw.githubusercontent.com/${{ github.repository }}/main/apps_audio/"
+          cdnjs_prefix = "https://cdnjs.cloudflare.com/ajax/libs/"
+
+          csv_file = "audio_links.csv"
+          rows = []
+
+          for root, _, files in os.walk("apps_audio"):
+              for f in files:
+                  if f.lower().endswith(('.mp3', '.m4a', '.png', '.jpg', '.jpeg')):
+                      full_path = os.path.join(root, f)
+                      rel_path = os.path.relpath(full_path, "apps_audio")
+                      size_mb = os.path.getsize(full_path) / (1024 * 1024)
+                      original_url = base_url + rel_path.replace("\\", "/")
+
+                      if size_mb < 20:
+                          github_url = github_repo + rel_path.replace("\\", "/")
+                          cdn_url = cdnjs_prefix + rel_path.replace("\\", "/")
+                      else:
+                          github_url = raw_repo + rel_path.replace("\\", "/")
+                          cdn_url = github_url  # same for >20MB
+
+                      rows.append([original_url, github_url, cdn_url, f"{size_mb:.2f} MB"])
+
+          with open(csv_file, "w", newline="", encoding="utf-8") as f:
+              writer = csv.writer(f)
+              writer.writerow(["Original URL", "GitHub URL", "CDNJS/Raw URL", "File Size"])
+              writer.writerows(rows)
+          EOF
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps_audio audio_links.csv
+          git commit -m "Update audio files and CSV mapping" || echo "No changes to commit"
+          git push
