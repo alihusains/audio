@@ -12,6 +12,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -21,14 +24,20 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget python3-pandas
+          sudo apt-get install -y wget rsync python3-pandas
 
-      - name: Download all audios and images
+      - name: Download/update audios and images (incremental)
         run: |
           mkdir -p apps_audio
-          cd apps_audio
+          # Use wget to mirror remote and rsync to update only changed files
+          # Download into a temporary directory first, then rsync to repo to preserve .git
+          TMPDIR=$(mktemp -d)
+          cd "$TMPDIR"
           wget -r -np -nH --cut-dirs=1 -R "index.html*" https://ya-mahdi.net/apps_audio/
-          cd ..
+          # Ensure the same directory layout (apps_audio/) exists in the tmp
+          rsync -av --delete --exclude='index.html*' ./apps_audio/ "${GITHUB_WORKSPACE}/apps_audio/"
+          cd "${GITHUB_WORKSPACE}"
+          rm -rf "$TMPDIR"
 
       - name: Generate CSV mapping file
         run: |
@@ -66,10 +75,74 @@ jobs:
               writer.writerows(rows)
           EOF
 
-      - name: Commit and push changes
+      - name: Commit and push changes incrementally
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apps_audio audio_links.csv
-          git commit -m "Update audio files and CSV mapping" || echo "No changes to commit"
-          git push
+
+          # Parameters
+          BATCH_SIZE=20            # Number of files to include per commit
+          MAX_DIRECT_MB=100        # maximum file size (MB) to commit directly (adjust as needed)
+
+          # Get the list of changed/untracked files under apps_audio and the CSV
+          mapfile -t changed < <(git status --porcelain --untracked-files=all -- apps_audio audio_links.csv | awk '{print $2}')
+
+          if [ ${#changed[@]} -eq 0 ]; then
+            echo "No changes detected."
+            exit 0
+          fi
+
+          # Optionally filter out very large files from direct commit
+          big_files=()
+          small_files=()
+          for f in "${changed[@]}"; do
+            if [ -f "$f" ]; then
+              size_mb=$(du -m "$f" | cut -f1)
+              if [ "$size_mb" -gt "$MAX_DIRECT_MB" ]; then
+                big_files+=("$f")
+              else
+                small_files+=("$f")
+              fi
+            else
+              # keep non-regular files (e.g., removed) in small list
+              small_files+=("$f")
+            fi
+          done
+
+          echo "Total changed files: ${#changed[@]}"
+          echo "Small files to commit: ${#small_files[@]}"
+          echo "Large files skipped for direct commit: ${#big_files[@]}"
+
+          # Commit small files in batches
+          i=0
+          while [ $i -lt ${#small_files[@]} ]; do
+            batch=("${small_files[@]:$i:$BATCH_SIZE}")
+            echo "Committing batch starting at index $i (size ${#batch[@]})"
+            git add -- "${batch[@]}"
+            git commit -m "Update audio files (batch commit) - files ${i}..$((i + ${#batch[@]} - 1))" || echo "No changes to commit in this batch"
+            git push --set-upstream origin HEAD || echo "Push failed for this batch"
+            i=$((i + BATCH_SIZE))
+          done
+
+          # Handle large files: commit them one-by-one (or skip pushing large binaries if you prefer)
+          for f in "${big_files[@]}"; do
+            echo "Handling large file: $f (committing separately)"
+            git add -- "$f"
+            git commit -m "Add/update large file: $f" || echo "No changes to commit for $f"
+            git push --set-upstream origin HEAD || echo "Push failed for large file $f"
+          done
+
+          # Finally, ensure audio_links.csv is committed if not already
+          if git ls-files --error-unmatch audio_links.csv >/dev/null 2>&1; then
+            if ! git diff --quiet --exit-code -- audio_links.csv || [ -n "$(git ls-files --others --exclude-standard audio_links.csv)" ]; then
+              git add audio_links.csv
+              git commit -m "Update audio_links.csv" || echo "No changes to commit for CSV"
+              git push --set-upstream origin HEAD || echo "Push failed for audio_links.csv"
+            fi
+          fi
+
+          echo "Incremental commits complete."
