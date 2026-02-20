@@ -17,8 +17,7 @@ What it does:
   6. Pushes after each batch.
 
 Notes:
-  - This script expects the remote site to either allow directory listing or provide links that wget/requests can find.
-  - If the remote server does not provide a directory index, you may need an explicit list of files.
+  - This script must be run from the repository root to ensure git paths are correct.
   - For large files or many files consider using Git LFS or external storage.
 """
 
@@ -26,9 +25,6 @@ import os
 import sys
 import csv
 import time
-import math
-import shutil
-import hashlib
 import subprocess
 from urllib.parse import urljoin, urlparse
 import requests
@@ -60,10 +56,6 @@ def ensure_dir(p):
 
 
 def get_remote_index(url):
-    """
-    Fetch and parse an HTML directory listing at url.
-    Returns list of hrefs (possibly relative) found on the page.
-    """
     try:
         r = session.get(url, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -75,36 +67,13 @@ def get_remote_index(url):
     hrefs = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # Skip parent dir anchors
         if href in ("../", "/"):
             continue
         hrefs.append(href)
     return hrefs
 
 
-def is_directory_listing(url):
-    """
-    Try to decide if the URL returns an HTML directory listing by checking its content-type
-    and presence of <a href> tags.
-    """
-    try:
-        r = session.get(url, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        ct = r.headers.get("Content-Type", "")
-        if "html" in ct.lower():
-            if "<a " in r.text.lower():
-                return True
-    except Exception:
-        pass
-    return False
-
-
 def walk_remote(base_url):
-    """
-    Walk the remote directory tree starting at base_url and yield remote file URLs
-    whose path ends with one of the desired extensions.
-    This assumes the remote exposes HTML directory listings with links.
-    """
     to_visit = [base_url]
     seen_dirs = set()
     files = []
@@ -120,11 +89,9 @@ def walk_remote(base_url):
             full = urljoin(url, href)
             parsed = urlparse(full)
             path = parsed.path
-            # If href ends with '/', treat as directory
             if href.endswith("/"):
                 to_visit.append(full)
             else:
-                # if extension matches, add
                 if os.path.splitext(path)[1].lower() in EXTENSIONS:
                     files.append(full)
     return files
@@ -139,7 +106,6 @@ def get_remote_size(url):
                 return int(cl)
     except Exception:
         pass
-    # fallback: try GET with stream and read headers
     try:
         r = session.get(url, stream=True, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -153,19 +119,17 @@ def get_remote_size(url):
 
 def download_file(url, dest_path):
     ensure_dir(os.path.dirname(dest_path))
-    # Check remote size and local size
     remote_size = get_remote_size(url)
     if remote_size is not None and remote_size > MAX_FILE_SIZE_BYTES:
         print(f"Skipping (too large > {MAX_FILE_SIZE_MB} MB): {url}")
-        return False  # not downloaded
+        return False
 
     if SKIP_IF_SAME_SIZE and os.path.exists(dest_path) and remote_size is not None:
         local_size = os.path.getsize(dest_path)
         if local_size == remote_size:
             print(f"Skipping (same size): {dest_path}")
-            return False  # not downloaded
+            return False
 
-    # Download with retries
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             with session.get(url, stream=True, timeout=REQUEST_TIMEOUT) as r:
@@ -186,15 +150,12 @@ def download_file(url, dest_path):
 
 
 def relpath_in_dest(url):
-    """Compute relative path under DEST_DIR from remote URL."""
     parsed = urlparse(url)
     path = parsed.path
-    # remote base path may include leading parts; we want path after /apps_audio/
-    idx = path.find("/apps_audio/")
+    idx = path.find(f"/{DEST_DIR}/")
     if idx != -1:
-        rel = path[idx + len("/apps_audio/"):]
+        rel = path[idx + len(f"/{DEST_DIR}/"):]
     else:
-        # fallback: take basename
         rel = os.path.basename(path)
     return rel.lstrip("/")
 
@@ -219,7 +180,6 @@ def generate_csv(dest_dir, csv_file, base_url):
                     github_url = raw_repo + rel_path
                     cdn_url = github_url
                 rows.append([original_url, github_url, cdn_url, f"{size_mb:.2f} MB"])
-    # write CSV
     rows.sort()
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -238,12 +198,10 @@ def run_git(args, check=True, capture_output=False):
 
 
 def get_git_repo_fullname():
-    # e.g. git remote get-url origin -> git@github.com:user/repo.git or https://github.com/user/repo.git
     try:
         url = run_git(["remote", "get-url", GIT_REMOTE], capture_output=True)
     except Exception:
         return "unknown/unknown"
-    # normalize
     if url.startswith("git@github.com:"):
         path = url.split(":", 1)[1]
     elif url.startswith("https://") or url.startswith("http://"):
@@ -256,40 +214,50 @@ def get_git_repo_fullname():
 
 
 def get_changed_files(paths):
-    """
-    Return list of changed/untracked files among the provided paths relative to repo root,
-    using git status --porcelain.
-    """
-    # Use porcelain status
     out = run_git(["status", "--porcelain", "--untracked-files=all", "--"] + list(paths), capture_output=True)
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     files = []
     for line in lines:
-        # format: XY <path>  or "?? <path>"
         parts = line.split(maxsplit=1)
         if len(parts) == 2:
             files.append(parts[1])
     return files
 
 
-def commit_and_push_batch_for_paths(paths, batch_index=None):
+def normalize_repo_relative_path(path):
     """
-    Stage, commit, and push the provided paths as a single batch.
-    paths should be a list of file paths relative to repo root.
+    Ensure path is relative to repo root and uses forward slashes for git.
+    Called with an absolute or relative path; returns a relative path.
+    """
+    abs_path = os.path.abspath(path)
+    repo_root = os.path.abspath(os.getcwd())
+    try:
+        rel = os.path.relpath(abs_path, repo_root)
+    except Exception:
+        rel = path
+    # Convert backslashes on Windows to forward slashes for git
+    return rel.replace(os.sep, "/")
+
+
+def commit_and_push_paths(paths, batch_index=None):
+    """
+    Stage, commit, and push the provided list of file paths while preserving folder structure.
+    Paths should be repo-relative paths (or will be normalized).
     """
     if not paths:
         return False
-    # Normalize paths (remove duplicates)
-    unique_paths = []
+    # Normalize and deduplicate while preserving order
+    normed = []
     seen = set()
     for p in paths:
-        np = os.path.normpath(p)
+        np = normalize_repo_relative_path(p)
         if np not in seen:
             seen.add(np)
-            unique_paths.append(np)
-    print(f"Committing batch of {len(unique_paths)} files...")
+            normed.append(np)
+
+    print(f"Committing batch of {len(normed)} files (preserving folder structure).")
     try:
-        run_git(["add"] + unique_paths)
+        run_git(["add"] + normed)
     except subprocess.CalledProcessError as e:
         print(f"git add failed: {e}")
         return False
@@ -297,13 +265,13 @@ def commit_and_push_batch_for_paths(paths, batch_index=None):
     msg = "Update audio files"
     if batch_index is not None:
         msg = f"{msg} (batch {batch_index})"
+
     try:
         run_git(["commit", "-m", msg])
     except subprocess.CalledProcessError:
         print("No changes to commit in this batch.")
-        # unstage to keep state clean
         try:
-            run_git(["reset", "--"] + unique_paths)
+            run_git(["reset", "--"] + normed)
         except Exception:
             pass
         return False
@@ -323,25 +291,24 @@ def commit_and_push_batch_for_paths(paths, batch_index=None):
 
 
 def main():
+    # Important: run from repo root to preserve relative paths for git
+    repo_root = os.path.abspath(os.getcwd())
+    print(f"Repository root: {repo_root}")
     ensure_dir(DEST_DIR)
 
-    # Discover remote files
     print("Discovering remote files...")
     remote_files = walk_remote(REMOTE_BASE_URL)
     print(f"Found {len(remote_files)} remote files (matching extensions).")
 
-    # Download files, commit/push after every BATCH_SIZE downloads
-    downloaded_paths_for_batch = []
+    downloaded_for_batch = []
     total_downloaded = 0
     batch_count = 0
-    all_downloaded_paths = []
 
     for url in remote_files:
         rel = relpath_in_dest(url)
         dest_path = os.path.join(DEST_DIR, rel)
         dest_path = os.path.normpath(dest_path)
 
-        # Pre-check remote size to possibly skip large files before trying to download
         remote_size = get_remote_size(url)
         if remote_size is not None and remote_size > MAX_FILE_SIZE_BYTES:
             print(f"Skipping remote file (size {remote_size} bytes > {MAX_FILE_SIZE_MB} MB): {url}")
@@ -349,38 +316,30 @@ def main():
 
         downloaded = download_file(url, dest_path)
         if downloaded:
-            downloaded_paths_for_batch.append(dest_path)
-            all_downloaded_paths.append(dest_path)
+            downloaded_for_batch.append(dest_path)
             total_downloaded += 1
 
-        # If we've collected BATCH_SIZE downloaded files, commit & push them
-        if len(downloaded_paths_for_batch) >= BATCH_SIZE:
+        if len(downloaded_for_batch) >= BATCH_SIZE:
             batch_count += 1
-            # Convert to relative paths for git (already relative to repo root)
-            rel_paths_for_git = [os.path.normpath(p) for p in downloaded_paths_for_batch]
-            print(f"Batch-ready: committing/pushing {len(rel_paths_for_git)} downloaded files (batch {batch_count})")
-            commit_and_push_batch_for_paths(rel_paths_for_git, batch_index=batch_count)
-            downloaded_paths_for_batch = []  # reset for next batch
+            print(f"Batch {batch_count}: preparing to commit {len(downloaded_for_batch)} files.")
+            commit_and_push_paths(downloaded_for_batch, batch_index=batch_count)
+            downloaded_for_batch = []
 
-    # After loop, if any remaining downloaded files that didn't make a full batch, commit/push them
-    if downloaded_paths_for_batch:
+    # Final partial batch
+    if downloaded_for_batch:
         batch_count += 1
-        rel_paths_for_git = [os.path.normpath(p) for p in downloaded_paths_for_batch]
-        print(f"Final partial batch: committing/pushing {len(rel_paths_for_git)} downloaded files (batch {batch_count})")
-        commit_and_push_batch_for_paths(rel_paths_for_git, batch_index=batch_count)
-        downloaded_paths_for_batch = []
+        print(f"Final batch {batch_count}: preparing to commit {len(downloaded_for_batch)} files.")
+        commit_and_push_paths(downloaded_for_batch, batch_index=batch_count)
+        downloaded_for_batch = []
 
     print(f"Total downloaded files: {total_downloaded}")
 
-    # After downloads, generate CSV (this may change CSV even if no files changed)
+    # Generate CSV and commit/push if changed
     generate_csv(DEST_DIR, CSV_FILE, REMOTE_BASE_URL)
-
-    # Check if CSV changed; if so, commit and push it
-    paths_to_check = [CSV_FILE]
-    changed = get_changed_files(paths_to_check)
-    if changed:
+    changed_csv = get_changed_files([CSV_FILE])
+    if changed_csv:
         print("CSV changed; committing and pushing CSV.")
-        commit_and_push_batch_for_paths(changed, batch_index="csv")
+        commit_and_push_paths(changed_csv, batch_index="csv")
     else:
         print("No CSV changes detected.")
 
